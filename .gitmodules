@@ -1,3 +1,6 @@
 [submodule "vcglib"]
 	path = vcglib
 	url = git@github.com:cnr-isti-vclab/vcglib.git
+[submodule "libs/vcglib"]
+	path = libs/vcglib
+	url = git@github.com:VitoBarra/vcglib.git
