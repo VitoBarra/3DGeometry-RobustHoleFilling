@@ -87,9 +87,9 @@ int main( int argc, char **argv )
           do 
           { 
             assert(pos.IsBorder());
-            assert(!pos.F()->IsV());
+            assert(!pos.F()->IsV()); //check if the face previously visited
 
-            pos.F()->SetV();
+            pos.F()->SetV(); //set face as visited
             // Loop around the vertex
             do {
               pos.FlipE();
