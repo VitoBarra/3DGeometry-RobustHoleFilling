@@ -1,38 +1,29 @@
-#include <direct.h>
-#include <iostream>
 #include <chrono>
+#include <iostream>
 
+#include <cmath>
+#include <vector>
 #include <vcg/complex/complex.h>
-#include <wrap/io_trimesh/import_ply.h>
 #include <vcg/complex/algorithms/clean.h>
-#include <wrap/io_trimesh/export_ply.h>
-#include <vcg/complex/algorithms/update/topology.h>
-#include "file.h"
-#include "vcg/complex/algorithms/hole.h"
 #include <vcg/complex/algorithms/isotropic_remeshing.h>
+#include <vcg/complex/algorithms/update/topology.h>
+#include <vcg/simplex/face/topology.h>
+#include <vcg/space/point3.h>
+#include <vcg/space/triangle3.h>
+#include <wrap/io_trimesh/import_ply.h>
+#include "vcg/complex/algorithms/hole.h"
+
+
+#include "file.h"
+#include "utility.h"
+#include "debug.h"
+
 
 using namespace  vcg;
 class MyVertex; class MyEdge; class MyFace;
 
 
-// LaplacianInfo: Helper class for Laplacian smoothing operations
-// Stores the sum of neighboring vertices' positions and the count of neighbors
-// Used for calculating the average position in smoothing operations
-template <typename MeshType>
-class LaplacianInfo
-{
-public:
-    LaplacianInfo(const MeshType::CoordType& _p, const int _n) : sum(_p), cnt(_n)
-    {
-    }
 
-    LaplacianInfo()
-    {
-    }
-
-    typename MeshType::CoordType sum; // Sum of neighboring vertices' positions
-    typename MeshType::ScalarType cnt; // Count of neighboring vertices
-};
 
 // Base types definition for the mesh components
 struct MyUsedTypes : public UsedTypes<Use<MyVertex>::AsVertexType,
@@ -42,7 +33,7 @@ struct MyUsedTypes : public UsedTypes<Use<MyVertex>::AsVertexType,
 };
 
 // Vertex class with 3D coordinates, normals, vertex-face adjacency and flags
-class MyVertex : public Vertex<MyUsedTypes, vertex::Coord3f, vertex::Normal3f, vertex::VFAdj, vertex::BitFlags, vertex::Mark>
+class MyVertex : public Vertex<MyUsedTypes, vertex::Coord3f, vertex::Normal3f, vertex::VFAdj,vertex::VEAdj, vertex::BitFlags, vertex::Mark>
 {
 };
 
@@ -59,67 +50,171 @@ class MyEdge : public Edge<MyUsedTypes>
 // Main mesh class composed of vertices and faces stored in vectors
 class MyMesh    : public tri::TriMesh< std::vector<MyVertex>, std::vector<MyFace> > {};
 
-bool DO_CLEAN_UP = false;
-
-
-
 
 
 
 template <class MeshType>
-void execute_mesh_refinement(MeshType& mesh, float targetEdgeLen)
+void HolePatchRefinement(MeshType &mesh, float densityFactor = 1.414213562373f) //square root 2
 {
-  tri::IsotropicRemeshing<MyMesh>::Params params;
-  params.SetFeatureAngleDeg(181.0f);
-  params.adapt        = false;
-  params.selectedOnly = true;
-  params.splitFlag    = true;
-  params.collapseFlag = true;
-  params.swapFlag     = true;
-  params.smoothFlag   = true;
-  params.projectFlag  = false;
-  params.surfDistCheck= false;
+    using namespace vcg::tri;
+    typedef typename MeshType::VertexType VertexType;
+    typedef typename MeshType::FaceType FaceType;
 
-  // Refinement and smoothing can be tricky. Usually it is good to
-  // 1) start with large tris to get fast convergence to the min surf
-  // 2) switch a bit to small tri to unfold bad things at the boundary
-  // 3) go for the desired edge len
-  // Rinse and repeat.
-  for (int k = 0; k < 3; k++)
-  {
-    params.SetTargetLen(targetEdgeLen * 3.0);
-    params.iter = 5;
-    tri::IsotropicRemeshing<MyMesh>::Do(mesh, params);
+    UpdateTopology<MeshType>::FaceFace(mesh);
+    UpdateTopology<MeshType>::VertexFace(mesh);
 
-    params.SetTargetLen(targetEdgeLen / 3.0);
-    params.iter = 3;
-    tri::IsotropicRemeshing<MyMesh>::Do(mesh, params);
+    std::map<VertexType*, float> meanLenghtMap;
 
-    params.SetTargetLen(targetEdgeLen);
-    params.iter = 2;
-    tri::IsotropicRemeshing<MyMesh>::Do(mesh, params);
-  }
+    // Step 1: Compute the mean edge length laundry for each boundary vertex
+    for (MyVertex &v : mesh.vert)
+    {
+        if (v.IsD() || !v.IsS()) continue;
+        float sumLen = 0.0f;
+        float count = 0;
+        std::vector<MyVertex *> verts;
+
+        // compute the VV adjacency 
+        vcg::face::VVStarVF<MyFace>(&v,verts) ;
+
+        // Calculate average edge length using VV adjacency
+        for (MyVertex* adj : verts)
+        {
+            sumLen += Distance(v.P(), adj->P());
+            count++;
+        }
+
+        // Store average edge length in scale attribute
+        meanLenghtMap[&v] = (count > 0) ? sumLen / count : 0.0f;
+    }
+
+    bool updated = true;
+    int counter = 1;
+    while (true)
+    {
+        updated = false;
+
+        // Step 2: For each triangle
+        std::vector<FaceType*> newFaces;
+        for (MyFace &f : mesh.face)
+        {
+            if (f.IsD() || !f.IsS()) continue;
+
+            // Compute centroid
+            vcg::Point3f vertexCentroid = (f.V(0)->P() + f.V(1)->P() + f.V(2)->P()) / 3.0f;
+            float c_MeanLength = (meanLenghtMap[f.V(0)] + meanLenghtMap[f.V(1)] + meanLenghtMap[f.V(2)]) / 3.0f;
+
+            bool needToAddTriangle = true;
+            for (int i = 0; i < 3; ++i)
+            {
+                float weightedDistance = densityFactor*Distance(vertexCentroid, f.V(i)->P());
+                if (weightedDistance <= c_MeanLength || weightedDistance <= meanLenghtMap[f.V(i)]) {
+                    needToAddTriangle = false;
+                    break;
+                }
+            }
+
+            if (needToAddTriangle)
+            {
+                updated = true;
+                // Insert centroid vertex
+                auto vC = Allocator<MeshType>::AddVertex(mesh,vertexCentroid);
+                MyVertex *v = &vC[0];
+                // Replace triangle with 3 new triangles
+                MyFace* f1 = &*Allocator<MeshType>::AddFace(mesh, v, f.V(1), f.V(2));
+                MyFace* f2 = &*Allocator<MeshType>::AddFace(mesh, f.V(0), v, f.V(2));
+                MyFace* f3 = &*Allocator<MeshType>::AddFace(mesh, f.V(0), f.V(1), v);
+                f1->SetS();
+                f2->SetS();
+                f3->SetS();
+                Allocator<MeshType>::DeleteFace(mesh, f);
+            }
+        }
+
+
+
+        if (!updated)
+            return;
+
+        //recompute adjacency
+        tri::UpdateTopology<MeshType>::FaceFace(mesh);
+        tri::UpdateTopology<MeshType>::VertexFace(mesh);
+
+
+        bool swappedEdge = true;
+        while (swappedEdge)
+        {
+            ExportMeshInFolder(mesh, "test" + std::to_string(counter));
+            counter++;
+            tri::UpdateTopology<MyMesh>::FaceFace(mesh);
+            tri::UpdateTopology<MyMesh>::VertexFace(mesh);
+            // Step 4: Relax all interior edges
+            swappedEdge= false;
+            for (MyFace &f : mesh.face)
+            {
+                tri::UpdateTopology<MyMesh>::FaceFace(mesh);
+                tri::UpdateTopology<MyMesh>::VertexFace(mesh);
+                if (f.IsD() || !f.IsS()) continue;
+
+                for (int edge = 0; edge < 3; ++edge)
+                {
+                    // Get the adjacent face across edge i
+                    MyFace *adjF = f.FFp(edge);
+                    int adjEdgeIdx = f.FFi(edge);
+
+                    if (adjF ==nullptr || adjF == &f || adjF->IsD()) continue;
+
+                    // Get shared edge vertices
+                    MyVertex *v0 = f.V0(edge);
+                    MyVertex *v1 = f.V1(edge);
+
+                    // Get opposing vertices
+                    MyVertex *vOppF = f.V2(edge);
+                    MyVertex *vOppAdj = adjF->V2(adjEdgeIdx);
+
+                    // Compute circumcircle of triangle (v0, v1, vOppF)
+                    vcg::Triangle3 tri(v0->P(), v1->P(), vOppF->P());
+                    vcg::Point3f circumcenter = Circumcenter(tri);
+                    float circumcenter_radius= Distance(circumcenter, v0->P());
+
+                    // Print face references
+
+                    std::cout << "------------------------------------------------------------------"<< std::endl;
+                    std::cout << "Face   1: " << &f << " | Face   2: " << adjF << std::endl;
+                    std::cout << "vertex 0: " << f.cV0(edge) << " | vertex 0: " << adjF->cV0(edge) << std::endl;
+                    std::cout << "vertex 1: " << f.cV1(edge) << " | vertex 1: " << adjF->cV1(edge) << std::endl;
+                    std::cout << "vertex 2: " << f.cV2(edge) << " | vertex 2: " << adjF->cV2(edge) << std::endl;
+                    std::cout << std::flush;
+
+
+
+                    if (Distance(circumcenter, vOppAdj->P()) < circumcenter_radius) {
+                        try
+                        {
+                            face::FlipEdge<MyFace>(f, edge);
+                        }
+                        catch (std::exception &e)
+                        {
+                            tri::UpdateSelection<MyMesh>::FaceClear(mesh);
+                            f.SetS();
+                            adjF->SetS();
+                            ExportMeshInFolder(mesh, "failed");
+                            throw e;
+                        }
+                    }
+                }
+
+
+            }
+
+
+            swappedEdge= true;
+        }
+
+    }
 }
 
 
 
-// Weight types for mesh operations:
-// uniform - all edges have equal weight
-// distance - weight based on edge length
-// cotangent - weight based on angles (for preserving geometric features)
-enum TypeOfWeight
-{
-    uniform = 0, // Equal weights
-    distance = 1, // Distance-based weights
-    cotangent = 2, // Cotangent weights (angle-based)
-};
-
-
-// calculate the cotangent function, it is stable around 0 and pi but can have some instabilities around pi/2
-float cot(float angle)
-{
-    return tan(M_PI *0.5 - angle);
-}
 
 
 template <class MeshType>
@@ -212,16 +307,7 @@ static void AccumulateLaplacianInfo(MeshType &m, SimpleTempData<typename MeshTyp
     }
 }
 
-// Parameters:
-//   m - Input mesh to be smoothed
-//   step - Number of smoothing iterations
-//   alpha - Smoothing factor (0-1), controls the intensity of smoothing
-//   SmoothSelected - If true, only smooth selected vertices
-template <class MeshType>
-static void CloneMesh(MeshType& source, MeshType& target)
-{
-    tri::Append<MeshType, MeshType>::MeshCopy(target, source);
-}
+
 
 template <class MeshType>
 static void HoleFairing(MeshType &m, int step, float alpha, bool SmoothSelected = false , TypeOfWeight weightType = uniform)
@@ -247,90 +333,85 @@ static void HoleFairing(MeshType &m, int step, float alpha, bool SmoothSelected 
     }
 }
 
-std::string getWeightTypeSuffix(TypeOfWeight tow)
-{
-    switch (tow)
-    {
-    case uniform: return "_uniform";
-    case distance: return "_distance";
-    case cotangent: return "_cotangent";
-    default: return "_uniform";
-    }
-}
+
+
 
 int main( int argc, char **argv )
 {
-    fs::path meshesFolder = fs::current_path().parent_path() / "TestMesh";
-    fs::path outputFilename ="";
     for (auto &v : GetFilesInFolderExtension(meshesFolder ,".ply"))
     {
-        MyMesh Mesh;
-        std::string meshName =fs::path(v).filename().string();
+        MyMesh mesh;
+        meshName =fs::path(v).filename().string();
 
-        if(tri::io::ImporterPLY<MyMesh>::Open(Mesh,v.c_str())!=0)
+        if(tri::io::ImporterPLY<MyMesh>::Open(mesh,v.c_str())!=0)
         {
             printf("Error reading file  %s\n",meshName);
             continue;
         }
-        size_t originalFaceNumber= Mesh.FN();
-        printf("mesh %s has vertexes:%i faces:%i\n",meshName.c_str(),Mesh.VN(),originalFaceNumber);
+        size_t originalFaceNumber= mesh.FN();
+        printf("mesh %s has vertexes:%i faces:%i\n",meshName.c_str(),mesh.VN(),originalFaceNumber);
         // Counting the number of edges using FF adjacency
 
-        //Clean up unreferenced vertices if cleanup flag is set
-        if (DO_CLEAN_UP)
-            tri::Clean<MyMesh>::RemoveUnreferencedVertex(Mesh);
-        tri::UpdateFlags<MyMesh>::FaceBorderFromNone(Mesh); // Initialize border flags
-        tri::UpdateTopology<MyMesh>::FaceFace(Mesh); // Compute information for face-to-face adjacency
-        tri::UpdateTopology<MyMesh>::VertexFace(Mesh); // Compute information for vertex-to-face adjacency
+        //Clean up unreferenced vertices
+        tri::Clean<MyMesh>::RemoveUnreferencedVertex(mesh);
+        tri::UpdateFlags<MyMesh>::FaceBorderFromNone(mesh); // Initialize border flags
+        tri::UpdateTopology<MyMesh>::FaceFace(mesh); // Compute information for face-to-face adjacency
+        tri::UpdateTopology<MyMesh>::VertexFace(mesh); // Compute information for vertex-to-face adjacency
 
         // Fill holes in the mesh using ear cutting algorithm with minimum weight criterion
-        tri::Hole<MyMesh>::EarCuttingFill<tri::MinimumWeightEar< MyMesh> >(Mesh,500,false,nullptr);
-        assert(tri::Clean<MyMesh>::IsFFAdjacencyConsistent(Mesh));
+        tri::Hole<MyMesh>::EarCuttingFill<tri::MinimumWeightEar< MyMesh> >(mesh,500,false,nullptr);
+        assert(tri::Clean<MyMesh>::IsFFAdjacencyConsistent(mesh));
 
         // update mesh topology information
-        tri::UpdateNormal<MyMesh>::NormalizePerFaceByArea(Mesh);
-        tri::UpdateTopology<MyMesh>::FaceFace(Mesh);
-        tri::UpdateTopology<MyMesh>::VertexFace(Mesh);
+        tri::UpdateNormal<MyMesh>::NormalizePerFaceByArea(mesh);
+        tri::UpdateTopology<MyMesh>::FaceFace(mesh);
+        tri::UpdateTopology<MyMesh>::VertexFace(mesh);
 
         // Clear selection
-        tri::UpdateSelection<MyMesh>::FaceClear(Mesh);
-        tri::UpdateSelection<MyMesh>::VertexClear(Mesh);
+        tri::UpdateSelection<MyMesh>::FaceClear(mesh);
+        tri::UpdateSelection<MyMesh>::VertexClear(mesh);
 
-        outputFilename = meshesFolder / "HoleFilled"/ meshName;
-        ExportMesh<MyMesh>(Mesh, outputFilename);
+        ExportMeshInFolder(mesh, "HoleFilled");
 
 
         size_t vertexSelected = 0;
         size_t faceIndex = originalFaceNumber;
         // First, select all new faces
-        for (; faceIndex < Mesh.FN(); ++faceIndex)
+        for (; faceIndex < mesh.FN(); ++faceIndex)
         {
-            if (Mesh.face[faceIndex].IsD())
+            if (mesh.face[faceIndex].IsD())
                 continue;
-            Mesh.face[faceIndex].SetS();
-
+            mesh.face[faceIndex].SetS();
+            // Select all vertices of this face
+            for (int v = 0; v < mesh.face[faceIndex].VN(); ++v)
+            {
+                mesh.face[faceIndex].V(v)->SetS();
+                vertexSelected++;
+            }
         }
 
         std::cout << "number of face selected " << faceIndex - originalFaceNumber << std::endl;
         std::cout << "number of vertex selected " << vertexSelected << std::endl;
-        execute_mesh_refinement(Mesh,0.01555);
-
-        tri::UpdateSelection<MyMesh>::VertexClear(Mesh);
-        tri::UpdateNormal<MyMesh>::NormalizePerFaceByArea(Mesh);
-        tri::UpdateTopology<MyMesh>::FaceFace(Mesh);
-        tri::UpdateTopology<MyMesh>::VertexFace(Mesh);
+        HolePatchRefinement(mesh);
+        // Compact mesh to remove deleted elements
+        tri::Allocator<MyMesh>::CompactFaceVector(mesh);
+        tri::Allocator<MyMesh>::CompactVertexVector(mesh);
+        tri::UpdateSelection<MyMesh>::VertexClear(mesh);
+        tri::UpdateNormal<MyMesh>::NormalizePerFaceByArea(mesh);
+        tri::UpdateTopology<MyMesh>::FaceFace(mesh);
+        tri::UpdateTopology<MyMesh>::VertexFace(mesh);
 
         // Then select vertices that have all adjacent faces selected
         faceIndex = originalFaceNumber;
         // First, select all new faces
-        for (; faceIndex < Mesh.FN(); ++faceIndex)
+        for (; faceIndex < mesh.FN(); ++faceIndex)
         {
-            if (Mesh.face[faceIndex].IsD())
+            if (mesh.face[faceIndex].IsD())
                 continue;
 
-            for (int v=0 ; v<Mesh.face[faceIndex].VN(); ++v)
+            for (int v=0 ; v<mesh.face[faceIndex].VN(); ++v)
             {
-                auto vertex = Mesh.face[faceIndex].V(v);
+                auto vertex = mesh.face[faceIndex].V(v);
                 if (vertex->IsD()) continue;
 
 
@@ -361,8 +442,8 @@ int main( int argc, char **argv )
 
         std::cout << "number of vertex selected " << vertexSelected << std::endl;
 
-        outputFilename = meshesFolder / "HoleFilledAndRefined"/ meshName;
-        ExportMesh<MyMesh>(Mesh, outputFilename);
+        ExportMeshInFolder(mesh, "HoleFilledAndRefined");
+
 
         // Apply cotangent smoothing
         for (int i =0 ; i<3; i++)
@@ -371,7 +452,7 @@ int main( int argc, char **argv )
             TypeOfWeight tow = static_cast<TypeOfWeight>(i);
             std::string weightTypeSuffix = getWeightTypeSuffix(tow);
 
-            CloneMesh(Mesh, meshCopy);
+            CloneMesh(mesh, meshCopy);
 
             auto start = std::chrono::high_resolution_clock::now();
             HoleFairing<MyMesh>(meshCopy, 100,1, true, tow);
@@ -380,9 +461,9 @@ int main( int argc, char **argv )
 
             std::cout << "HoleFairing Duration (" << weightTypeSuffix << "): " << duration.count() << " seconds" <<
                 std::endl;
-            outputFilename = meshesFolder / ("HoleFilledAndRefined"+ weightTypeSuffix) / meshName;
-            ExportMesh<MyMesh>(meshCopy, outputFilename);
+            ExportMeshInFolder(meshCopy,"HoleFilledAndRefined"+ weightTypeSuffix);
         }
     }
     return 0;
 }
+

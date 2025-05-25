@@ -16,3 +16,18 @@ add_executable(${CMAKE_PROJECT_NAME} ${SOURCE} ${HEADER})
 add_subdirectory("libs/vcglib")
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${VCGLib_SOURCE_DIR} )
 target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC vcglib )
+
+
+# Option to enable the Address Sanitizer for debugging purposes
+option(ENABLE_ASAN "Enable Address Sanitizer" OFF)
+if(ENABLE_ASAN)
+    if(MSVC)
+        message(WARNING "Address Sanitizer is not supported with MSVC.")
+    else()
+        message(STATUS "Address Sanitizer enabled")
+        set(ASAN_FLAGS "-fsanitize=address -fno-omit-frame-pointer")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ASAN_FLAGS}")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${ASAN_FLAGS}")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${ASAN_FLAGS}")
+    endif()
+endif()

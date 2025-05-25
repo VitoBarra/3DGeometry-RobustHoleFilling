@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <vector>
 #include <string>
+#include <sys/stat.h>
 
 namespace fs = std::filesystem;
 
@@ -26,5 +27,21 @@ inline std::vector<std::string> GetFilesInFolderExtension(const fs::path& folder
     }
 
     return off_files;
+}
+
+
+
+template<class MeshType>
+void ExportMesh(const MeshType &mesh,fs::path path)
+{
+    std::cout << "exporting:"<< path.filename() << std::endl;
+
+    fs::create_directories(path.parent_path());
+    // Save mesh with flags (mask) enabled
+    int result = vcg::tri::io::ExporterPLY<MeshType>::Save(mesh, path.string().c_str(), vcg::tri::io::Mask::IOM_ALL);
+    if (result != 0)
+        std::cerr << "Error saving mesh: " << vcg::tri::io::ExporterPLY<MeshType>::ErrorMsg(result) << std::endl;
+    else
+        std::cout << "Mesh successfully saved to " << path << std::endl;
 }
 #endif
