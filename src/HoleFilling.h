@@ -91,7 +91,6 @@ void HolePatchRefinement(MeshType &mesh, float densityFactor = 1.414213562373f) 
         meanEdgeLength[tri::Index(mesh,v)] = meanLength;
         v.Q()= meanLength;
     }
-    ExportMeshInFolder<MeshType>(mesh, "HoleFilledPerVertexMeanEdgeLength");
 
     bool updated = true;
     while (true)
@@ -170,15 +169,12 @@ void HolePatchRefinement(MeshType &mesh, float densityFactor = 1.414213562373f) 
         ExportMeshInFolder<MeshType>(mesh, "HoleFilledPreSwap_step"+std::to_string(step_counter));
 
         //Relax all interior edges
-        int edgeSwapped=0;
-        do
+        for (int retry = 0; retry<3;)
         {
-            edgeSwapped=0;
+            int edgeSwapped = 0;
             //recompute adjacency
             tri::UpdateTopology<MeshType>::FaceFace(mesh);
             tri::UpdateTopology<MeshType>::VertexFace(mesh);
-            int edgeSwapped=0;
-            swappedEdge = false;
             for (FaceType &f : mesh.face)
             {
                 if (f.IsD() || !f.IsS()) continue;
@@ -212,7 +208,10 @@ void HolePatchRefinement(MeshType &mesh, float densityFactor = 1.414213562373f) 
                     }
                 }
             }
-            std::cout<< "swapped " <<edgeSwapped<<" edges"<< std::endl;
+            if (edgeSwapped==0) // if no edge is swapped, there is nothing left to do
+                break;
+            if (edgeSwapped<5)   // if some few edges were swapped, maybe almost finished or the swap is in a loop
+                retry++;
         }
 
         ExportMeshInFolder<MeshType>(mesh, "HoleFilledPostSwap_step"+std::to_string(step_counter));
