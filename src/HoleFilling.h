@@ -4,13 +4,13 @@
 
 #ifndef HOLEFILLING_H
 #define HOLEFILLING_H
-#include "MeshIO.h"
 #include "vcg/space/point.h"
 #include <cmath>
-#include <vcg/complex/algorithms/update/topology.h>
-#include <vcg/complex/complex.h>
-#include <vcg/simplex/face/topology.h>
 #include <vector>
+#include <vcg/complex/complex.h>
+#include <vcg/complex/algorithms/update/topology.h>
+#include <vcg/simplex/face/topology.h>
+
 
 using namespace vcg;
 template<class VertexType>
@@ -60,29 +60,38 @@ void HolePatchRefinement(MeshType &mesh, float densityFactor = 1.414213562373f) 
     tri::UpdateTopology<MeshType>::FaceFace(mesh);
     tri::UpdateTopology<MeshType>::VertexFace(mesh);
 
-    std::map<VertexType*, float> meanLengthMap;
+    std::map<int, float> meanEdgeLength;
 
-    // Step 1: Compute the average edges length laundry for each boundary vertex
+    // Compute the average edges length for each boundary vertex ignoring internal edges
     for (VertexType &v : mesh.vert)
     {
         if (v.IsD() || !v.IsS()) continue;
         float sumLen = 0.0f;
         float count = 0;
-        std::vector<VertexType *> verts;
+        std::vector<FaceType *> faces;
+        std::vector<int> verIND;
 
         // compute the VV adjacency
-        vcg::face::VVStarVF<FaceType>(&v,verts) ;
+        vcg::face::VFStarVF<FaceType>(&v,faces,verIND) ;
 
         // Calculate average edge length using VV adjacency
-        for (VertexType* adj : verts)
+        for (FaceType* f : faces)
         {
-            sumLen += Distance(v.P(), adj->P());
-            count++;
+            if (f->IsD() || f->IsS()) continue;
+            for (int j = 0; j < 3; ++j)
+            {
+                if (f->V(j) == &v) continue;
+                sumLen += Distance(v.P(), f->V(j)->P());
+                count++;
+            }
         }
 
         // Store average edge length in scale attribute
-        meanLengthMap[&v] = (count > 0) ? sumLen / count : 0.0f;
+        float meanLength =(count > 0) ? sumLen / count : std::numeric_limits<float>::infinity();
+        meanEdgeLength[tri::Index(mesh,v)] = meanLength;
+        v.Q()= meanLength;
     }
+    ExportMeshInFolder<MeshType>(mesh, "HoleFilledPerVertexMeanEdgeLength");
 
     bool updated = true;
     while (true)
@@ -90,22 +99,22 @@ void HolePatchRefinement(MeshType &mesh, float densityFactor = 1.414213562373f) 
         step_counter++;
         updated = false;
 
-        // Step 2: For each triangle
-        std::vector<std::tuple<VertexType*,VertexType*,VertexType*,VertexType*>> faceToAdd;
-        for (int i = 0  ; i < mesh.face.size(); i++)
+        std::vector<std::tuple<int,int, int,int >> faceToAdd;
+        for (FaceType &f : mesh.face)
         {
-            FaceType* f = &mesh.face[i];
-            if (f->IsD() || !f->IsS() ) continue;
+            if (f.IsD() || !f.IsS() ) continue;
 
-            vcg::Point3f vertexCentroid = (f->V(0)->P() + f->V(1)->P() + f->V(2)->P()) / 3.0f;
             // Compute centroid
-            float c_MeanLength = (meanLengthMap[f->V(0)] + meanLengthMap[f->V(1)] + meanLengthMap[f->V(2)]) / 3.0f;
+            vcg::Point3f centroidPos = (f.V(0)->P() + f.V(1)->P() + f.V(2)->P()) / 3.0f;
+            const float centroidMeanLength = ( meanEdgeLength[tri::Index(mesh,f.V(0))] +meanEdgeLength[tri::Index(mesh,f.V(1))] + meanEdgeLength[tri::Index(mesh,f.V(2))]) / 3.0f;
+
+
 
             bool needToAddTriangle = true;
-            for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
             {
-                float weightedDistance = densityFactor*Distance(vertexCentroid, f->V(i)->P());
-                if (weightedDistance <= c_MeanLength || weightedDistance <= meanLengthMap[f->V(i)]) {
+                float weightedDistance = densityFactor*Distance(centroidPos, f.V(j)->P());
+                if (!(weightedDistance > centroidMeanLength && weightedDistance > meanEdgeLength[tri::Index(mesh,f.V(j))])) {
                     needToAddTriangle = false;
                     break;
                 }
@@ -114,32 +123,36 @@ void HolePatchRefinement(MeshType &mesh, float densityFactor = 1.414213562373f) 
             if (needToAddTriangle)
             {
                 updated = true;
-                // Insert centroid vertex
-                auto vC = tri::Allocator<MeshType>::AddVertex(mesh,vertexCentroid);
-                VertexType* v = &*vC;
+                VertexType* centroidVert = &*tri::Allocator<MeshType>::AddVertex(mesh,centroidPos);
+                meanEdgeLength[tri::Index(mesh,centroidVert)] = centroidMeanLength;
+                centroidVert->Q()= centroidMeanLength;
 
-                // Replace triangle with 3 new triangles
-                VertexType* v0f = f->V(0);
-                VertexType* v1f = f->V(1);
-                VertexType* v2f = f->V(2);
-                faceToAdd.push_back(std::make_tuple(v0f, v1f, v2f, v));
+                // save vertexes indices
+                int v0fi = tri::Index(mesh,f.V(0)); //vertex 0 face index
+                int v1fi = tri::Index(mesh,f.V(1));
+                int v2fi = tri::Index(mesh,f.V(2));
+                int vci = tri::Index(mesh,centroidVert) ; // vertex centroid index
+                faceToAdd.push_back(std::make_tuple(v0fi, v1fi, v2fi, vci));
 
                 // Delete the original face after storing vertices
-                tri::Allocator<MeshType>::DeleteFace(mesh, *f);
+                tri::Allocator<MeshType>::DeleteFace(mesh, f);
             }
         }
+
         tri::Allocator<MeshType>::CompactFaceVector(mesh);
 
-        for (const auto &face : faceToAdd)
+        //Add faces
+        for (const auto &[v0fi,v1fi,v2fi,vci] : faceToAdd)
         {
-            VertexType *v0f = std::get<0>(face);
-            VertexType *v1f = std::get<1>(face);
-            VertexType *v2f = std::get<2>(face);
-            VertexType *v   = std::get<3>(face);
+            VertexType* v0f = &mesh.vert[v0fi];
+            VertexType* v1f = &mesh.vert[v1fi];
+            VertexType* v2f = &mesh.vert[v2fi];
+            VertexType* v   = &mesh.vert[vci];
+
+
             // first face:  (v, v1f, v2f)
             auto f1 = tri::Allocator<MeshType>::AddFace(mesh, v, v1f, v2f);
             f1->SetS();
-
             // Second face: (v0f, v, v2f)
             auto f2 = tri::Allocator<MeshType>::AddFace(mesh, v0f, v, v2f);
             f2->SetS();
@@ -148,81 +161,61 @@ void HolePatchRefinement(MeshType &mesh, float densityFactor = 1.414213562373f) 
             auto f3 = tri::Allocator<MeshType>::AddFace(mesh, v0f, v1f, v);
             f3->SetS();
         }
+        faceToAdd.clear();
 
+        //Exit if not face is added
         if (!updated)
             return;
 
-        //recompute adjacency
-        tri::UpdateTopology<MeshType>::FaceFace(mesh);
-        tri::UpdateTopology<MeshType>::VertexFace(mesh);
+        ExportMeshInFolder<MeshType>(mesh, "HoleFilledPreSwap_step"+std::to_string(step_counter));
 
-
-        bool swappedEdge = true;
-        while (swappedEdge)
+        //Relax all interior edges
+        int edgeSwapped=0;
+        do
         {
+            edgeSwapped=0;
+            //recompute adjacency
             tri::UpdateTopology<MeshType>::FaceFace(mesh);
             tri::UpdateTopology<MeshType>::VertexFace(mesh);
-            // Step 4: Relax all interior edges
-            swappedEdge= false;
+            int edgeSwapped=0;
+            swappedEdge = false;
             for (FaceType &f : mesh.face)
             {
                 if (f.IsD() || !f.IsS()) continue;
 
                 for (int edge = 0; edge < 3; ++edge)
                 {
-                    // Get the adjacent face across edge i
+                    // Get the adjacent face across the edge
                     FaceType *adjF = f.FFp(edge);
                     int adjEdgeIdx = f.FFi(edge);
 
-                    if (adjF ==nullptr || adjF == &f || adjF->IsD()) continue;
+                    if (adjF->IsD() || !adjF->IsS() || adjF ==nullptr || adjF == &f   ) continue;
 
-                    // Get shared edge vertices
+                    // Get shared-edge vertices
                     VertexType *v0 = f.V0(edge);
                     VertexType *v1 = f.V1(edge);
 
                     // Get opposing vertices
-                    VertexType *vOppF = f.V2(edge);
+                    VertexType *vOppF   = f.V2(edge);
                     VertexType *vOppAdj = adjF->V2(adjEdgeIdx);
 
-                    // Compute circumcircle of triangle (v0, v1, vOppF)
+                    // Compute circumcircle of the opposite triangle (v0, v1, vOppF)
                     Triangle3 tri(v0->P(), v1->P(), vOppF->P());
                     Point3f circumcenter = Circumcenter(tri);
-                    float circumcenter_radius= Distance(circumcenter, v0->P());
-
-                    // Print face references
-
-                    // std::cout << "------------------------------------------------------------------"<< std::endl;
-                    // std::cout << "Face   1: " << &f << " | Face   2: " << adjF << std::endl;
-                    // std::cout << "vertex 0: " << f.cV0(edge) << " | vertex 0: " << adjF->cV0(edge) << std::endl;
-                    // std::cout << "vertex 1: " << f.cV1(edge) << " | vertex 1: " << adjF->cV1(edge) << std::endl;
-                    // std::cout << "vertex 2: " << f.cV2(edge) << " | vertex 2: " << adjF->cV2(edge) << std::endl;
-                    // std::cout << std::flush;
+                    const float circumSphere_radius = Distance(circumcenter,vOppF ->P());
+                    const float oppositeAdjVertexDistance = Distance(circumcenter, vOppAdj->P());
 
 
-
-                    if (Distance(circumcenter, vOppAdj->P()) < circumcenter_radius) {
-                        try
-                        {
-                            face::FlipEdge<FaceType>(f, edge);
-                            swappedEdge= true;
-                        }
-                        catch (std::exception &e)
-                        {
-                            tri::UpdateSelection<MeshType>::FaceClear(mesh);
-                            f.SetS();
-                            adjF->SetS();
-                            ExportMeshInFolder(mesh, "failed");
-                            //throw e;
-                        }
+                    if (oppositeAdjVertexDistance < circumSphere_radius) {
+                        face::FlipEdge<FaceType>(f, edge);
+                        edgeSwapped++;
                     }
                 }
-
-
             }
-
-
+            std::cout<< "swapped " <<edgeSwapped<<" edges"<< std::endl;
         }
 
+        ExportMeshInFolder<MeshType>(mesh, "HoleFilledPostSwap_step"+std::to_string(step_counter));
     }
 }
 

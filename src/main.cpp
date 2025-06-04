@@ -30,7 +30,7 @@ struct MyUsedTypes : public UsedTypes<Use<MyVertex>::AsVertexType,
 };
 
 // Vertex class with 3D coordinates, normals, vertex-face adjacency and flags
-class MyVertex : public Vertex<MyUsedTypes, vertex::Coord3f, vertex::Normal3f, vertex::VFAdj,vertex::VEAdj, vertex::BitFlags, vertex::Mark>
+class MyVertex : public Vertex<MyUsedTypes, vertex::Coord3f, vertex::Normal3f, vertex::VFAdj,vertex::VEAdj, vertex::BitFlags, vertex::Mark, vertex::Qualityf>
 {
 };
 
@@ -94,7 +94,7 @@ int main( int argc, char **argv )
         tri::UpdateTopology<MyMesh>::VertexFace(mesh); // Compute information for vertex-to-face adjacency
 
         // Fill holes in the mesh using ear cutting algorithm with minimum weight criterion
-        tri::Hole<MyMesh>::EarCuttingFill<tri::SelfIntersectionEar< MyMesh> >(mesh,500,false,nullptr);
+        tri::Hole<MyMesh>::EarCuttingFill<tri::MinimumWeightEar< MyMesh> >(mesh,500,false,nullptr);
         assert(tri::Clean<MyMesh>::IsFFAdjacencyConsistent(mesh));
 
         // update mesh topology information
@@ -127,6 +127,7 @@ int main( int argc, char **argv )
         std::cout << "number of face selected " << faceIndex - originalFaceNumber << std::endl;
         std::cout << "number of vertex selected " << vertexSelected << std::endl;
         ExportMeshInFolder(mesh, "HoleFilledAndSelected");
+
         HolePatchRefinement<MyMesh>(mesh);
         // Compact mesh to remove deleted elements
         tri::Allocator<MyMesh>::CompactFaceVector(mesh);
